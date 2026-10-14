@@ -1,72 +1,76 @@
 # Agentic Workflow Control Plane
 
-A dependency-free proof of checkpointed agentic work: plan, execute, record an artifact, recover from failure, and stop for approval before an external action.
+A short Python example of a job that runs named steps, keeps each result on the job, and stops when it reaches a step called `external_action`. The standard library is enough. The demo returns fixed synthetic strings and stays inside the process.
 
-## MCP host pattern
-
-An MCP **server** exposes capabilities. An MCP **host** owns the runtime that launches or connects to multiple servers, discovers their tools, namespaces collisions, applies an allowlist, and routes calls through policy.
-
-A defensible host should provide:
-
-- multiple stdio or HTTP connections with bounded timeouts;
-- namespaced tool identifiers such as `mcp_git_search` and `mcp_docs_search`;
-- an allowlist that exposes only the tools needed for the current workflow;
-- schema filtering so unused tools do not consume the model context;
-- cancellation, retry, and reconnect behavior;
-- audit events recording server, tool, arguments class, result state, and approval state;
-- explicit separation between read-only tools and side-effectful tools;
-- fail-closed behavior when a server or policy decision is unavailable.
-
-This repository demonstrates the host boundary without connecting to real accounts or external MCP servers. For the reference implementation and protocol details, see the [Model Context Protocol documentation](https://modelcontextprotocol.io/) and the [PixelRAG-style visual retrieval example](https://github.com/StarTrail-org/PixelRAG) for a separate multimodal use case.
-
-## Philosophy
-
-An agent is useful when its work is inspectable, interruptible, and recoverable. Planning is separate from execution. Tools are capabilities, not permissions. The final action remains a human decision.
-
-## Run
+## Clone
 
 ```bash
-python -m workflow.demo
-python -m unittest discover -s tests -v
+git clone https://github.com/yellowlotuscg/agentic-workflow-control-plane.git
 ```
 
-## Controls shown
+## How a run works
 
-- bounded steps and retries
-- checkpointed state
-- deterministic artifacts
-- explicit approval gate
-- fail-closed external action
-- append-only event history
+A `Job` holds a `goal`, an ordered list of `steps`, a `state`, an `artifacts` dict, and an `events` list. A new job starts as `planned`.
 
-Synthetic lead data only. It does not contact customers or external services. Relevant practices include human-in-the-loop control, least privilege, idempotency, retry budgets, timeout boundaries, NIST AI RMF concepts, and OWASP LLM application-security guidance.
+`WorkflowEngine` is constructed with a dict of names to functions. `run` sets `state` to `running` and appends `started`, then walks the steps in order:
 
-## Implemented
+- A step named `external_action` sets `state` to `waiting_for_approval`, appends `approval_required`, and returns before any lookup in the action dict. The remaining steps are skipped.
+- A name missing from the dict sets `state` to `failed`, appends `unknown_step:<name>`, and returns. The remaining steps are skipped.
+- A known name calls `actions[step](job)`, stores the return value at `artifacts[step]`, and appends `completed:<step>`.
+- After the last step, `state` becomes `completed` and the engine appends `completed`.
 
-The repository contains working code, not mockups:
+A second call to `run` on the same job starts again at the first step and appends another `started`.
 
-- A `Job` record with a goal, an ordered list of steps, a state, an artifact store, and an event history (`workflow/engine.py`).
-- A `WorkflowEngine` that executes each step against a small in-process action registry. The demo registers `research` and `draft` handlers that return synthetic content (`workflow/demo.py`).
-- Checkpointed progress: each completed step stores its artifact and an event such as `completed:research`, so an interrupted job can be inspected step by step.
-- A fail-closed approval gate: when a job reaches the `external_action` step, the engine stops immediately, sets state to `waiting_for_approval`, records an `approval_required` event, and returns without running anything beyond that point.
-- Fail-closed handling of unknown steps: an unregistered step name marks the job `failed` with an `unknown_step:<name>` event instead of continuing or guessing.
-- An append-only event history on each job (`started`, `completed:<step>`, `approval_required`, `failed`).
+`workflow/demo.py` registers two functions and runs one job:
 
-## Limitations
+- `research` returns `synthetic business facts`
+- `draft` returns `approval-ready brief`
+- goal `qualify a lead`, steps `research`, `draft`, `external_action`
 
-- The action registry is in-process only. Actions are plain Python callables; there is no live MCP server, tool discovery, namespace handling, or schema filtering in this proof of concept.
-- Nothing is persisted. Jobs and events live only while the process runs.
-- No external side effect is ever performed. The engine stops at `waiting_for_approval`; there is no sending, spending, or other outbound action.
-- Retry, timeout, cancellation, and reconnect behavior are described as host responsibilities in the README but are not implemented in this code.
-- Approval is a state transition only. There is no authentication, policy engine, or multi-operator review layer.
-- All workflow content in the demo is synthetic.
+```mermaid
+flowchart TD
+  planned[Job starts planned] --> running[run marks the job running]
+  running --> decide{Look at the next step}
+  decide -->|name is external_action| approval[Stop with waiting_for_approval]
+  decide -->|name missing from actions| failed[Stop with failed]
+  decide -->|name is registered| record[Save the artifact and continue]
+  record --> decide
+  decide -->|no steps left| completed[Finish as completed]
+```
+
+## Sample run
+
+Recorded with Python 3.12.3:
+
+```text
+$ python3 -m workflow.demo
+{'state': 'waiting_for_approval', 'artifacts': {'research': 'synthetic business facts', 'draft': 'approval-ready brief'}, 'events': ['started', 'completed:research', 'completed:draft', 'approval_required']}
+```
 
 ## Tests
 
-The standard-library `unittest` suite lives in `tests/test_engine.py` and verifies that a job running `research`, then `external_action`:
+`tests/test_engine.py` has one test. It runs the steps `a` and `external_action`, and the `a` action returns `"artifact"`. The assertions check that `state` is `waiting_for_approval` and that `artifacts["a"]` is `"artifact"`.
 
-- records the `research` artifact before stopping;
-- ends in state `waiting_for_approval`;
-- records both `completed:research` and `approval_required` events.
+```text
+$ python3 -m unittest discover -s tests -v
+test_external_action_stops (test_engine.Tests.test_external_action_stops) ... ok
 
-Run it locally with `python -m unittest discover -s tests -v`. GitHub Actions runs the same command on every push to `main` and every pull request into `main` (see `.github/workflows/tests.yml`), with read-only token permissions and no credentials stored in the workflow.
+----------------------------------------------------------------------
+Ran 1 test in 0.000s
+
+OK
+```
+
+GitHub Actions (`.github/workflows/tests.yml`) runs `python -m unittest discover -s tests -v` on every push to `main` and every pull request into `main`. The job installs Python 3.12 and sets `permissions: contents: read`. The workflow file contains no secrets.
+
+Use `python3` when that is the interpreter on your machine. The Actions runner provides `python`.
+
+## Scope
+
+Actions are plain functions in this process. The job lives on the `Job` object until the process exits. Approval is the `waiting_for_approval` state. The engine has no retry loop, timeout, or checkpoint file.
+
+The [Model Context Protocol documentation](https://modelcontextprotocol.io/) describes hosts, servers, and tools. This repository is the in-process step runner above.
+
+## License
+
+MIT. Copyright (c) 2026 Matthew Coggins. See [LICENSE](LICENSE).
